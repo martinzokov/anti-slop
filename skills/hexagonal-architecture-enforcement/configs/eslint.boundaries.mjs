@@ -12,17 +12,16 @@
  *   1. `languageOptions.parser` — without a TS parser every file is a parse error.
  *   2. `settings["import/resolver"].typescript` — without it, extensionless TS
  *      imports do not resolve, every dependency is classified "unknown", and the
- *      layer policies never fire. A green run is not proof of a clean codebase;
- *      seed a deliberate violation once and confirm it is reported.
+ *      policies never fire. A green run is not proof of a clean codebase; seed a
+ *      deliberate violation once and confirm it is reported.
  *
- * Assumed layout:
- *   src/domain/          entities, value objects, rules   — imports nothing
- *   src/application/     use cases + port interfaces      — imports domain
- *   src/adapters/<name>/ http, postgres, stripe, ...      — imports application, domain
- *   src/main/            composition root                 — imports everything
- *
- * The composition root is a FOLDER, not a `src/main.ts` file. Element patterns
- * match folders; a file pattern warns and classifies unreliably.
+ * Layout:
+ *   src/domain/{model,service,event,exception}/
+ *   src/application/usecase/
+ *   src/application/port/{driving,driven}/
+ *   src/infrastructure/adapter/driving/<name>/     web, messaging, ...
+ *   src/infrastructure/adapter/driven/<name>/      persistence, payment, messaging, ...
+ *   src/infrastructure/config/                     composition root
  */
 import boundaries from "eslint-plugin-boundaries";
 import tseslint from "typescript-eslint";
@@ -36,49 +35,89 @@ export default [
       "import/resolver": { typescript: { alwaysTryTypes: true } },
       "boundaries/elements": [
         { type: "domain", pattern: "src/domain/**" },
-        { type: "application", pattern: "src/application/**" },
-        // `capture` names the adapter folder so a policy can say "only my own".
-        { type: "adapter", pattern: "src/adapters/*/**", capture: ["adapterName"] },
-        { type: "main", pattern: "src/main/**" },
+        { type: "port-driving", pattern: "src/application/port/driving/**" },
+        { type: "port-driven", pattern: "src/application/port/driven/**" },
+        { type: "usecase", pattern: "src/application/usecase/**" },
+        // Two captures: `side` is driving|driven, `adapterName` is the leaf folder.
+        // Together they identify one adapter uniquely.
+        {
+          type: "adapter",
+          pattern: "src/infrastructure/adapter/*/*/**",
+          capture: ["side", "adapterName"],
+        },
+        { type: "config", pattern: "src/infrastructure/config/**" },
       ],
     },
     rules: {
       // Deny by default. Allowed edges are enumerated below; anything not listed
-      // is an error. An allow-by-default config silently permits every layer you
+      // is an error. An allow-by-default config silently permits every edge you
       // forget to name — never use one.
       "boundaries/dependencies": [
         "error",
         {
           default: "disallow",
           policies: [
+            // Domain knows nothing but itself.
             {
               from: { element: { type: "domain" } },
               allow: { to: { element: { type: "domain" } } },
             },
+            // Ports are pure interfaces over domain types. A port that imports a
+            // use case has inverted the dependency the wrong way.
             {
-              from: { element: { type: "application" } },
-              allow: { to: { element: { types: { anyOf: ["application", "domain"] } } } },
+              from: { element: { types: { anyOf: ["port-driving", "port-driven"] } } },
+              allow: {
+                to: {
+                  element: { types: { anyOf: ["domain", "port-driving", "port-driven"] } },
+                },
+              },
             },
+            // A use case implements a driving port and calls driven ports.
             {
-              from: { element: { type: "adapter" } },
-              allow: { to: { element: { types: { anyOf: ["application", "domain"] } } } },
+              from: { element: { type: "usecase" } },
+              allow: {
+                to: {
+                  element: {
+                    types: { anyOf: ["domain", "port-driving", "port-driven", "usecase"] },
+                  },
+                },
+              },
             },
+            // Driving adapters (controllers, consumers) enter through driving
+            // ports only — never a use case class, never a driven port.
             {
-              // An adapter may import itself, but not a sibling adapter.
-              // `{{from.captured.adapterName}}` is v6+ template syntax; the older
-              // `${...}` form still works but warns.
+              from: { element: { type: "adapter", captured: { side: "driving" } } },
+              allow: { to: { element: { types: { anyOf: ["domain", "port-driving"] } } } },
+            },
+            // Driven adapters (repositories, gateways, publishers) implement
+            // driven ports only.
+            {
+              from: { element: { type: "adapter", captured: { side: "driven" } } },
+              allow: { to: { element: { types: { anyOf: ["domain", "port-driven"] } } } },
+            },
+            // An adapter may import its own folder, but no other adapter — not a
+            // sibling on the same side, and not one across the driving/driven line.
+            // `{{from.captured.*}}` is v6+ template syntax; the older `${...}`
+            // form still works but warns.
+            {
               from: { element: { type: "adapter" } },
               allow: {
                 to: {
                   element: {
                     type: "adapter",
-                    captured: { adapterName: "{{from.captured.adapterName}}" },
+                    captured: {
+                      side: "{{from.captured.side}}",
+                      adapterName: "{{from.captured.adapterName}}",
+                    },
                   },
                 },
               },
             },
+            // The composition root wires everything, so it may see everything.
+            // Nothing may import it — that is the `default: "disallow"` above,
+            // since no policy ever names `config` as a target.
             {
-              from: { element: { type: "main" } },
+              from: { element: { type: "config" } },
               allow: { to: { element: { type: "*" } } },
             },
           ],
@@ -100,7 +139,7 @@ export default [
           rules: [
             { from: ["domain"], disallow: ["*"] },
             {
-              from: ["application"],
+              from: ["usecase", "port-driving", "port-driven"],
               disallow: [
                 "express",
                 "fastify",
@@ -110,6 +149,9 @@ export default [
                 "mongoose",
                 "knex",
                 "axios",
+                "kafkajs",
+                "stripe",
+                "pg",
               ],
             },
           ],
