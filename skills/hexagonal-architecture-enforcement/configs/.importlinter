@@ -1,0 +1,68 @@
+# Hexagonal boundary enforcement for Python.
+# Run: lint-imports          (pip install import-linter)
+#
+# Assumed layout:
+#   myapp/domain/          entities, value objects, rules   — imports nothing
+#   myapp/application/     use cases + Protocol ports       — imports domain
+#   myapp/adapters/<name>/ http, postgres, stripe, ...      — imports application, domain
+#   myapp/main.py          composition root                 — imports everything
+
+[importlinter]
+root_package = myapp
+# Required for the `forbidden` contract below to see third-party packages.
+include_external_packages = True
+
+[importlinter:contract:layers]
+name = Hexagonal layers
+type = layers
+# `containers` is required for `exhaustive` — layers are then named relative to it.
+containers =
+    myapp
+# Highest layer first. Each layer may import the ones below it, never above.
+layers =
+    adapters
+    application
+    domain
+# Any other module inside the container must be listed here or the check fails —
+# this is what stops a fourth, unpoliced layer (myapp/services/, myapp/utils/).
+exhaustive = True
+exhaustive_ignores =
+    main
+
+[importlinter:contract:adapter-independence]
+name = Adapters do not know each other
+type = independence
+modules =
+    myapp.adapters.http
+    myapp.adapters.postgres
+    myapp.adapters.stripe
+
+[importlinter:contract:domain-purity]
+name = Domain imports no infrastructure
+type = forbidden
+# The `layers` contract only inspects myapp.*; without this, a domain entity is
+# free to import sqlalchemy. This is the contract that actually keeps it pure.
+source_modules =
+    myapp.domain
+forbidden_modules =
+    sqlalchemy
+    django
+    fastapi
+    flask
+    requests
+    httpx
+    boto3
+    redis
+    celery
+
+[importlinter:contract:application-purity]
+name = Use cases import no frameworks
+type = forbidden
+source_modules =
+    myapp.application
+forbidden_modules =
+    sqlalchemy
+    fastapi
+    flask
+    django
+    boto3
