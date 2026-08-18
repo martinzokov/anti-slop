@@ -1,6 +1,6 @@
 ---
 name: hexagonal-architecture-enforcement
-description: "Use when setting up or working in a hexagonal / ports-and-adapters codebase. Layer boundaries — including the driving/driven split — must be enforced by a linter or the compiler, never by convention. Includes verified configs for TypeScript, Python, Java, Go, C#, and Rust."
+description: "Use when setting up or working in a hexagonal / ports-and-adapters codebase. Layer boundaries — including the driving/driven split — must be enforced by a linter or the compiler, never by convention. Ships per-language configs for TypeScript, Python, Go, Java, C# and Rust, each validated against a working fixture."
 category: software-development
 ---
 
@@ -315,74 +315,159 @@ Split into `src/myapp_domain`, `src/myapp_application`, `src/myapp_infrastructur
 
 ---
 
-## 5. Other Stacks (short recipes)
+## 5. Go
 
-**Java / Kotlin — ArchUnit.** The best-in-class option: hexagonal architecture is a first-class primitive and it runs as an ordinary JUnit test.
+Go gives you two boundaries before any config: `internal/` is compiler-enforced against outside modules, and **import cycles are a compile error**. That second one matters more than it sounds — in a wired application, most inward-pointing violations (domain→infrastructure, port→usecase) are *already* cycles, so `go build` rejects them before any linter runs. depguard's job is the violations that are not cycles: frameworks in the domain, adapter↔adapter imports, and driving-adapter→usecase.
 
-```java
-@ArchTest
-static final ArchRule hexagonal = Architectures.onionArchitecture()
-    .domainModels("com.acme.domain.model..")
-    .domainServices("com.acme.domain.service..")
-    .applicationServices("com.acme.application..")
-    .adapter("web",         "com.acme.infrastructure.adapter.driving.web..")
-    .adapter("messaging",   "com.acme.infrastructure.adapter.driving.messaging..")
-    .adapter("persistence", "com.acme.infrastructure.adapter.driven.persistence..")
-    .adapter("payment",     "com.acme.infrastructure.adapter.driven.payment..")
-    .withOptionalLayers(false);
-
-// onionArchitecture() gives you the vertical rule + adapter independence, but not
-// the driving/driven split. Add it explicitly:
-@ArchTest
-static final ArchRule drivingAdaptersUseDrivingPorts =
-    noClasses().that().resideInAPackage("..infrastructure.adapter.driving..")
-        .should().dependOnClassesThat()
-        .resideInAnyPackage("..application.usecase..", "..application.port.driven..");
-
-@ArchTest
-static final ArchRule domainHasNoFrameworks =
-    noClasses().that().resideInAPackage("..domain..")
-        .should().dependOnClassesThat()
-        .resideInAnyPackage("javax.persistence..", "jakarta.persistence..", "org.springframework..");
-```
-
-Tier 2: Gradle multi-project with `implementation project(":domain")` declared only where legal.
-
-**Go — the language does much of it for you.** Package-per-layer under `internal/`, plus depguard in golangci-lint:
+Full config at `configs/golangci-arch.yml` (golangci-lint schema v2). Merge into your existing `.golangci.yml`.
 
 ```yaml
-linters-settings:
-  depguard:
-    rules:
-      domain:
-        files: ["**/internal/domain/**"]
-        deny:
-          - pkg: "database/sql"
-            desc: "domain must not know about persistence"
-          - pkg: "net/http"
-            desc: "domain must not know about transport"
-          - pkg: "github.com/acme/app/internal/application"
-            desc: "inward dependencies only"
-          - pkg: "github.com/acme/app/internal/infrastructure"
-            desc: "inward dependencies only"
-      driving-adapters:
-        files: ["**/internal/infrastructure/adapter/driving/**"]
-        deny:
-          - pkg: "github.com/acme/app/internal/application/usecase"
-            desc: "enter through internal/application/port/driving"
-          - pkg: "github.com/acme/app/internal/application/port/driven"
-            desc: "driving adapters do not use driven ports"
+version: "2"
+linters:
+  default: none
+  enable: [depguard]
+  settings:
+    depguard:
+      rules:
+        domain:
+          files: ["**/internal/domain/**"]
+          deny:
+            - pkg: github.com/acme/app/internal/infrastructure
+              desc: "domain must not import infrastructure — declare a driven port instead."
+            - pkg: database/sql
+              desc: "domain must not know about persistence."
+        driving-adapters:
+          files: ["**/internal/infrastructure/adapter/driving/**"]
+          deny:
+            - pkg: github.com/acme/app/internal/application/usecase
+              desc: "enter through application/port/driving — importing the use case type welds transport to implementation."
+            - pkg: github.com/acme/app/internal/application/port/driven
+              desc: "a driving adapter must not use driven ports — that is upside down."
+        composition-root:
+          files: ["**/internal/**", "!**/internal/infrastructure/config/**"]
+          deny:
+            - pkg: github.com/acme/app/internal/infrastructure/config
+              desc: "nothing may import the composition root."
 ```
 
-Go also forbids import cycles at compile time, which removes a whole class of boundary erosion for free. Reach for `go-arch-lint` once the depguard rules get unwieldy.
+`desc` is printed verbatim on violation — write it as an instruction to whoever hits it. The `!` prefix in `files` excludes a path, which is how the composition-root rule exempts the composition root itself.
 
-**C# — NetArchTest.Rules**, same shape as ArchUnit, asserted in an xUnit test. Tier 2: one `.csproj` per layer with `ProjectReference` only where legal — idiomatic in .NET and compile-time.
+Adapter independence needs one rule per adapter: depguard denies by package *prefix* and has no back-references, and a blanket `.../adapter` prefix would also flag an adapter importing its own subpackage. The shipped config spells out all five.
 
-**Rust — Cargo workspace, tier 2 by default.** One crate per layer (`domain`, `application`, `infrastructure`); `domain/Cargo.toml` with no sibling dependencies. Illegal imports fail to compile. No linter needed.
+Run: `golangci-lint run ./...` — and `golangci-lint config verify` to catch schema mistakes.
 
 ---
 
-## 6. Wiring It Into an Agentic Loop
+## 6. Java / Kotlin
+
+ArchUnit is the strongest tier-1 tool on any stack, for one reason: **it reads bytecode, not imports.** A domain class carrying `@Entity` has no import of your infrastructure at all, and every import-based linter misses it. ArchUnit sees the annotation, the field types, the constructor parameters and the generic arguments.
+
+Full test class at `configs/HexagonalArchitectureTest.java`. Add `testImplementation("com.tngtech.archunit:archunit-junit5:1.4.1")` and it runs as an ordinary JUnit 5 test.
+
+```java
+@AnalyzeClasses(packages = "com.acme")
+public class HexagonalArchitectureTest {
+
+    @ArchTest
+    static final ArchRule hexagonal_layers = Architectures.onionArchitecture()
+            .domainModels("com.acme.domain.model..")
+            .domainServices("com.acme.domain.service..", "com.acme.domain.event..",
+                            "com.acme.domain.exception..")
+            .applicationServices("com.acme.application..")
+            .adapter("web",         "com.acme.infrastructure.adapter.driving.web..")
+            .adapter("consumer",    "com.acme.infrastructure.adapter.driving.messaging..")
+            .adapter("persistence", "com.acme.infrastructure.adapter.driven.persistence..")
+            .adapter("payment",     "com.acme.infrastructure.adapter.driven.payment..")
+            .adapter("publisher",   "com.acme.infrastructure.adapter.driven.messaging..")
+            .withOptionalLayers(false);
+
+    // onionArchitecture() covers the vertical rule AND adapter independence, but
+    // treats all of `application` as one layer — so the port split needs its own rules.
+    @ArchTest
+    static final ArchRule driving_adapters_enter_through_driving_ports =
+            noClasses().that().resideInAPackage("..infrastructure.adapter.driving..")
+                    .should().dependOnClassesThat().resideInAnyPackage(
+                            "..application.usecase..", "..application.port.driven..");
+}
+```
+
+Two settings that decide whether this is real enforcement:
+
+- **`withOptionalLayers(false)`** — an empty layer becomes a failure instead of a silent pass. Without it, a typo in a package identifier makes the rule vacuously true and everything stays green.
+- **`@AnalyzeClasses(packages = ...)`** excludes test classes by default. If you customise the import, keep `ImportOption.DoNotIncludeTests` or your own fixtures will trip the rules.
+
+Tier 2: Gradle multi-project with `implementation project(":domain")` declared only where legal.
+
+---
+
+## 7. C#
+
+`NetArchTest.Rules` gives the same IL-level view as ArchUnit, asserted from xUnit. Full test class at `configs/HexagonalArchitectureTests.cs`.
+
+```csharp
+private static Types AppTypes =>
+    Types.InAssembly(typeof(Domain.Model.Order).Assembly);   // anchored on a TYPE, not a string
+
+[Fact]
+public void Driving_adapters_enter_through_driving_ports()
+{
+    var result = AppTypes
+        .That().ResideInNamespaceStartingWith(AdapterDriving)
+        .ShouldNot().HaveDependencyOnAny(UseCase, PortDriven)
+        .GetResult();
+
+    AssertArchitecture(result, "A driving adapter enters through Application.Port.Driving only.");
+}
+```
+
+Three things worth copying from the shipped file:
+
+- **Anchor the assembly on a type** (`typeof(Domain.Model.Order).Assembly`), not on an assembly-name string. A rename then breaks the build instead of silently emptying every rule.
+- **Surface `result.FailingTypeNames` in the assertion message.** NetArchTest's default failure is just `Assert.True(false)` — naming the offending types is what makes it actionable.
+- **Adapter independence as a `[Theory]`** with one `InlineData` per adapter, so a failure says which adapter broke the rule.
+
+Tier 2: one `.csproj` per layer with `ProjectReference` declared only where legal — idiomatic in .NET and compile-time. The xUnit rules then cover what project boundaries cannot express, chiefly the driving/driven split inside a single Application project.
+
+---
+
+## 8. Rust
+
+Rust has no mainstream module-boundary linter and does not need one. **A crate per layer makes every boundary a compile error** — tier 2 by default, nothing to configure or bypass. Full layout and manifests at `configs/rust-workspace.md`.
+
+The move that makes this stronger than any linter: split the two port sides into **separate crates**.
+
+```
+crates/
+├── domain/                     [dependencies] is empty — that IS the enforcement
+├── application-port-driving/   → domain
+├── application-port-driven/    → domain
+├── application-usecase/        → domain, both port crates
+├── adapter-driving-web/        → domain, port-driving        (port-driven not in scope)
+├── adapter-driven-persistence/ → domain, port-driven         (port-driving not in scope)
+└── config/                     → everything
+```
+
+A driving adapter whose manifest lists only `application-port-driving` *cannot name* a driven port. On every other stack that rule needs a linter; here it is `error[E0432]: unresolved import`.
+
+Use cases take ports as generic parameters, so the use-case crate never names an adapter:
+
+```rust
+pub struct PlaceOrder<R: OrderRepository, E: EventPublisher> { pub repo: R, pub events: E }
+```
+
+The one gap the crate graph cannot close is third-party crates — nothing stops someone adding `sqlx` to `crates/domain/Cargo.toml`. Close it with `cargo-deny`'s `wrappers` field, which permits a crate only for named consumers:
+
+```toml
+[[bans.deny]]
+name = "sqlx"
+wrappers = ["adapter-driven-persistence"]   # only this crate may depend on sqlx
+```
+
+Cost: ten crates for a small service is real overhead — ten manifests, slower cold builds. Take it when the architecture is load-bearing; otherwise use one crate with the same directory layout and accept that you have convention, not enforcement.
+
+---
+
+## 9. Wiring It Into an Agentic Loop
 
 Enforcement only changes agent behavior if the agent can run it and read the result. Five requirements:
 
@@ -409,7 +494,7 @@ Pre-commit hook (fast, local, no network):
 
 ---
 
-## 7. Failure Modes to Watch For
+## 10. Failure Modes to Watch For
 
 | Smell | Why it defeats the boundary |
 |---|---|
@@ -426,16 +511,18 @@ Pre-commit hook (fast, local, no network):
 
 ## Quick Reference
 
-| Stack | Tier 1 tool | Tier 2 (compile-time) |
-|---|---|---|
-| TypeScript | dependency-cruiser, eslint-plugin-boundaries | workspace packages + TS project references |
-| Python | import-linter (`layers` ×2 + `independence` + `forbidden`) | separate distributions per layer |
-| Java/Kotlin | ArchUnit `onionArchitecture()` + explicit driving/driven rules | Gradle multi-project |
-| Go | golangci-lint depguard, go-arch-lint | `internal/`, no import cycles |
-| C# | NetArchTest.Rules | one `.csproj` per layer |
-| Rust | — | Cargo workspace, crate per layer |
+Every config below was run against a working fixture in the layout from §1, clean and with seeded violations.
 
----
+| Stack | Tier 1 config | Sees | Tier 2 (compile-time) |
+|---|---|---|---|
+| TypeScript | `dependency-cruiser.js` / `eslint.boundaries.mjs` | imports, npm packages, cycles | workspace packages + project references |
+| Python | `.importlinter` | imports, PyPI packages, exhaustiveness | separate distributions per layer |
+| Go | `golangci-arch.yml` (depguard) | imports | `internal/`; cycles are compile errors |
+| Java/Kotlin | `HexagonalArchitectureTest.java` (ArchUnit) | **bytecode** — annotations, field types, signatures | Gradle multi-project |
+| C# | `HexagonalArchitectureTests.cs` (NetArchTest) | **IL** — same as ArchUnit | one `.csproj` per layer |
+| Rust | — none needed | — | `rust-workspace.md`: crate per layer, **violations do not compile** |
+
+Strength ordering, if you get to choose: Rust's crate graph > ArchUnit/NetArchTest bytecode rules > import-based linters. The gap that matters is annotations — `@Entity` on a domain model is invisible to every import-based tool.
 
 ## Sources
 
