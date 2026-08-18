@@ -1,6 +1,6 @@
 ---
 name: hexagonal-architecture-enforcement
-description: "Use when setting up or working in a hexagonal / ports-and-adapters codebase. Layer boundaries — including the driving/driven split — must be enforced by a linter or the compiler, never by convention. Ships a language-agnostic semgrep ruleset plus native configs for TypeScript, Python, Java, Go, C#, and Rust."
+description: "Use when setting up or working in a hexagonal / ports-and-adapters codebase. Layer boundaries — including the driving/driven split — must be enforced by a linter or the compiler, never by convention. Includes verified configs for TypeScript, Python, Java, Go, C#, and Rust."
 category: software-development
 ---
 
@@ -315,56 +315,7 @@ Split into `src/myapp_domain`, `src/myapp_application`, `src/myapp_infrastructur
 
 ---
 
-## 5. One Linter for Every Language
-
-Everything above is per-language. If you have a polyglot repo — or a language with no architecture tooling at all — use `configs/semgrep-hexagonal.yml`, a single rule file that enforces the same boundaries in any language.
-
-```bash
-pip install semgrep
-semgrep --config configs/semgrep-hexagonal.yml --error src/
-```
-
-**Why one rule file can cover every language:** hexagonal boundaries are *directory* rules, and every language names the import target as a path. Only the separator differs.
-
-| Language | An illegal import looks like |
-|---|---|
-| Python | `from myapp.infrastructure.adapter.driven.persistence import X` |
-| TypeScript | `import { X } from "../../infrastructure/adapter/driven/persistence/X"` |
-| Java | `import com.acme.infrastructure.adapter.driven.persistence.X;` |
-| Go | `"github.com/acme/app/internal/infrastructure/adapter/driven/persistence"` |
-| Rust | `use crate::infrastructure::adapter::driven::persistence::X;` |
-
-One regex over the *segment names* — `[/.:]infrastructure(?=[/.:"'\s;)])` — matches all five. `languages: [generic]` means semgrep needs no parser for this, so it also covers languages semgrep cannot parse. The shipped file has 12 rules: the vertical layer rule, framework purity, port purity, both driving/driven adapter rules, the composition-root rule, and one adapter-independence rule per adapter.
-
-Two implementation notes:
-
-- **Go's grouped imports have no keyword on the path line.** The regexes accept a bare quoted path (`_?\s*"`) as an alternative to the `import`/`from`/`use` prefix, which is what makes `import (\n\t"acme/internal/infrastructure/..."\n)` match.
-- **Adapter independence needs one rule per adapter.** There are no back-references between `paths` and `pattern-regex`, so each adapter gets a block with a negative lookahead on its own path (`[/.:]adapter[/.:]+(?!driving[/.:]+web…)`). Five adapters, five near-identical blocks.
-
-### What you give up
-
-This is a genuine floor, not a replacement. Ranked by how much it matters:
-
-| Limitation | Consequence | Covered instead by |
-|---|---|---|
-| **Parent-relative imports are invisible** | `import { X } from "../messaging/Consumer"` inside `adapter/driving/web` reaches a sibling adapter without the word "adapter" appearing anywhere. **Verified: this exact import slips through.** | dependency-cruiser / eslint-plugin-boundaries (they resolve paths), or path aliases + the opt-in rule at the bottom of the file |
-| No dependency-graph view of third-party packages | Framework purity is a hand-maintained deny-list; a new ORM nobody banned gets in | import-linter `forbidden` + `include_external_packages`, or dependency-cruiser's "may import nothing outside domain" |
-| No cycle detection | A → B → A passes | dependency-cruiser `circular: true`, Go's compiler |
-| No alias/re-export resolution | `@app/*` mappings and `__init__.py` re-exports are matched as written, not as resolved | native tools |
-| No exhaustiveness check | A new unpoliced top-level directory is silently fine | import-linter `exhaustive = True` |
-
-The relative-import gap is the one to take seriously, and it's asymmetric: **Python, Java, Go, and Rust are unaffected** because their imports carry absolute module paths. TypeScript/JavaScript is where it bites.
-
-### Which to use
-
-- **Polyglot repo, or a language with no arch tooling** → semgrep ruleset. It is the only option that covers everything with one policy.
-- **Single language with a good native tool** (TS, Python, JVM, Go) → the native tool. It sees packages, cycles, and resolved paths; the messages are better.
-- **Polyglot repo that also has a TS/JS service** → both. Semgrep as the shared floor across all services, dependency-cruiser on the TS one to close the relative-import gap.
-- **Any of the above, if you can afford the packaging** → add tier 2/3 underneath. Build-graph enforcement (Bazel `visibility`, Gradle projects, Cargo crates, workspace packages) is inherently language-agnostic *and* compile-time, which is strictly stronger than any linter. The linter then exists for the boundaries the build graph is too coarse to express — mainly the driving/driven port split inside `application`.
-
----
-
-## 6. Other Stacks (short recipes)
+## 5. Other Stacks (short recipes)
 
 **Java / Kotlin — ArchUnit.** The best-in-class option: hexagonal architecture is a first-class primitive and it runs as an ordinary JUnit test.
 
@@ -431,7 +382,7 @@ Go also forbids import cycles at compile time, which removes a whole class of bo
 
 ---
 
-## 7. Wiring It Into an Agentic Loop
+## 6. Wiring It Into an Agentic Loop
 
 Enforcement only changes agent behavior if the agent can run it and read the result. Five requirements:
 
@@ -458,7 +409,7 @@ Pre-commit hook (fast, local, no network):
 
 ---
 
-## 8. Failure Modes to Watch For
+## 7. Failure Modes to Watch For
 
 | Smell | Why it defeats the boundary |
 |---|---|
@@ -477,7 +428,6 @@ Pre-commit hook (fast, local, no network):
 
 | Stack | Tier 1 tool | Tier 2 (compile-time) |
 |---|---|---|
-| **Any / polyglot** | **semgrep `configs/semgrep-hexagonal.yml`** | build graph (Bazel visibility, per-language modules) |
 | TypeScript | dependency-cruiser, eslint-plugin-boundaries | workspace packages + TS project references |
 | Python | import-linter (`layers` ×2 + `independence` + `forbidden`) | separate distributions per layer |
 | Java/Kotlin | ArchUnit `onionArchitecture()` + explicit driving/driven rules | Gradle multi-project |
