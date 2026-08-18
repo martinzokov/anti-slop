@@ -1,0 +1,228 @@
+# Language-agnostic hexagonal boundary enforcement.
+#
+#   pip install semgrep
+#   semgrep --config configs/semgrep-hexagonal.yml --error src/
+#
+# WHY THIS WORKS FOR ANY LANGUAGE
+# Hexagonal boundaries are directory rules, and every language's import syntax
+# names the target module as a path: Python `myapp.application.usecase.x`,
+# TypeScript `../../application/usecase/X`, Go `acme/internal/application/usecase`,
+# Java `com.acme.application.usecase.X`, Rust `crate::application::usecase::x`.
+# The separator differs (`.` `/` `::`) but the segment names do not — so one
+# regex over the segment names covers all of them. `languages: [generic]` means
+# semgrep needs no parser, so this also works for languages semgrep cannot parse.
+#
+# WHAT IT CANNOT DO — use a native tool alongside it where one exists:
+#   * It cannot see third-party packages by dependency graph. `domain-imports-
+#     framework` below is a hand-maintained deny-list; import-linter and
+#     dependency-cruiser catch ANY external package with one rule.
+#   * It cannot detect import cycles.
+#   * It cannot resolve aliases/re-exports (`@app/*` path mappings, `__init__.py`
+#     re-exports). It matches the text you wrote, not what it resolves to.
+#   * BLIND SPOT — parent-relative imports. `import x from "../messaging/Consumer"`
+#     inside adapter/driving/web reaches a sibling adapter without the word
+#     "adapter" ever appearing, so no rule here can see it. Verified: this exact
+#     import slips through. Languages with absolute module paths (Python, Java,
+#     Go, Rust) are unaffected; TypeScript/JavaScript and Python relative imports
+#     are. Mitigate with EITHER a resolver-aware native tool (dependency-cruiser,
+#     eslint-plugin-boundaries) OR path aliases plus the opt-in rule at the very
+#     bottom of this file.
+#   * Adapter independence needs one rule per adapter (see the bottom section) —
+#     there are no back-references across `paths` and `pattern-regex`.
+#
+# ADAPTING IT: the rules key off path segment NAMES (domain, application,
+# usecase, port, driving, driven, infrastructure, adapter, config). Rename the
+# segments in `paths.include` and in the regexes together, or keep the names.
+
+rules:
+  # ------------------------------------------------------------------ domain
+
+  - id: domain-is-pure
+    languages: [generic]
+    severity: ERROR
+    message: >-
+      domain must not import application or infrastructure. Dependencies point
+      inward: if the domain needs persistence, the clock, or a gateway, take it
+      as an argument or declare a driven port in application/port/driven.
+    paths:
+      include:
+        - "**/domain/**"
+    pattern-regex: >-
+      (?m)^\s*(?:import|from|use|require|include|export|_?\s*")[^\n]*[/.:](?:application|infrastructure)(?=[/.:"'\s;)])
+
+  - id: domain-imports-framework
+    languages: [generic]
+    severity: ERROR
+    message: >-
+      domain must not depend on a framework or driver. An ORM annotation on an
+      entity is an outward dependency just as much as an import of an adapter.
+    paths:
+      include:
+        - "**/domain/**"
+    pattern-regex: >-
+      (?m)^\s*(?:import|from|use|require|include|_?\s*")[^\n]*\b(?:sqlalchemy|django|fastapi|flask|requests|httpx|boto3|redis|celery|psycopg2|express|fastify|nestjs|typeorm|prisma|mongoose|knex|axios|kafkajs|stripe|javax\.persistence|jakarta\.persistence|org\.springframework|org\.hibernate|database/sql|net/http)\b
+
+  # ------------------------------------------------------------- application
+
+  - id: application-imports-infrastructure
+    languages: [generic]
+    severity: ERROR
+    message: >-
+      application must not import infrastructure. Declare a port in
+      application/port/driven and let the adapter implement it.
+    paths:
+      include:
+        - "**/application/**"
+    pattern-regex: >-
+      (?m)^\s*(?:import|from|use|require|include|export|_?\s*")[^\n]*[/.:]infrastructure(?=[/.:"'\s;)])
+
+  - id: port-imports-usecase
+    languages: [generic]
+    severity: ERROR
+    message: >-
+      A port must not import a use case. The use case implements the driving
+      port, not the other way round — this edge inverts the dependency the
+      wrong way and makes the port unimplementable by anything else.
+    paths:
+      include:
+        - "**/application/port/**"
+    pattern-regex: >-
+      (?m)^\s*(?:import|from|use|require|include|export|_?\s*")[^\n]*[/.:]usecase(?=[/.:"'\s;)])
+
+  # ------------------------------------------------- driving / driven adapters
+
+  - id: driving-adapter-bypasses-driving-port
+    languages: [generic]
+    severity: ERROR
+    message: >-
+      A driving adapter (controller, consumer, CLI) must enter the application
+      through application/port/driving. Importing a use case class directly
+      welds the transport to the implementation and makes the driving port dead
+      code; importing a driven port is upside down.
+    paths:
+      include:
+        - "**/adapter/driving/**"
+        - "**/adapters/driving/**"
+    pattern-regex: >-
+      (?m)^\s*(?:import|from|use|require|include|export|_?\s*")[^\n]*(?:[/.:]usecase(?=[/.:"'\s;)])|[/.:]port[/.:]+driven(?=[/.:"'\s;)]))
+
+  - id: driven-adapter-calls-back-into-application
+    languages: [generic]
+    severity: ERROR
+    message: >-
+      A driven adapter (repository, gateway, publisher) implements a port from
+      application/port/driven and nothing else. Importing a use case or a
+      driving port is a cycle in disguise.
+    paths:
+      include:
+        - "**/adapter/driven/**"
+        - "**/adapters/driven/**"
+    pattern-regex: >-
+      (?m)^\s*(?:import|from|use|require|include|export|_?\s*")[^\n]*(?:[/.:]usecase(?=[/.:"'\s;)])|[/.:]port[/.:]+driving(?=[/.:"'\s;)]))
+
+  # -------------------------------------------------------- composition root
+
+  - id: imports-composition-root
+    languages: [generic]
+    severity: ERROR
+    message: >-
+      Nothing may import the composition root. infrastructure/config wires the
+      application together; if you need a value from it, you need it injected.
+    paths:
+      include:
+        - "**/domain/**"
+        - "**/application/**"
+        - "**/adapter/**"
+        - "**/adapters/**"
+    pattern-regex: >-
+      (?m)^\s*(?:import|from|use|require|include|export|_?\s*")[^\n]*[/.:]config(?=[/.:"'\s;)])
+
+  # ------------------------------------------------------ adapter independence
+  #
+  # No back-references are available here, so "any adapter but my own" needs one
+  # rule per adapter, using a negative lookahead on the adapter's own path.
+  # Copy a block per adapter; the only things that change are the id, the
+  # paths.include, and the two segments inside the lookahead.
+  #
+  # If you would rather not maintain one block per adapter, delete this section
+  # and rely on the coarse cross-side rule at the end, which needs no lookahead
+  # but only catches driving<->driven (not same-side siblings).
+
+  - id: adapter-independence-driving-web
+    languages: [generic]
+    severity: ERROR
+    message: >-
+      An adapter may not import another adapter. Route the call through a use
+      case, or through a port both adapters know. Shared helpers belong to
+      neither adapter — extract or duplicate them.
+    paths:
+      include:
+        - "**/adapter/driving/web/**"
+    pattern-regex: >-
+      (?m)^\s*(?:import|from|use|require|include|export|_?\s*")[^\n]*[/.:]adapter[/.:]+(?!driving[/.:]+web(?=[/.:"'\s;)]))
+
+  - id: adapter-independence-driving-messaging
+    languages: [generic]
+    severity: ERROR
+    message: An adapter may not import another adapter.
+    paths:
+      include:
+        - "**/adapter/driving/messaging/**"
+    pattern-regex: >-
+      (?m)^\s*(?:import|from|use|require|include|export|_?\s*")[^\n]*[/.:]adapter[/.:]+(?!driving[/.:]+messaging(?=[/.:"'\s;)]))
+
+  - id: adapter-independence-driven-persistence
+    languages: [generic]
+    severity: ERROR
+    message: An adapter may not import another adapter.
+    paths:
+      include:
+        - "**/adapter/driven/persistence/**"
+    pattern-regex: >-
+      (?m)^\s*(?:import|from|use|require|include|export|_?\s*")[^\n]*[/.:]adapter[/.:]+(?!driven[/.:]+persistence(?=[/.:"'\s;)]))
+
+  - id: adapter-independence-driven-payment
+    languages: [generic]
+    severity: ERROR
+    message: An adapter may not import another adapter.
+    paths:
+      include:
+        - "**/adapter/driven/payment/**"
+    pattern-regex: >-
+      (?m)^\s*(?:import|from|use|require|include|export|_?\s*")[^\n]*[/.:]adapter[/.:]+(?!driven[/.:]+payment(?=[/.:"'\s;)]))
+
+  - id: adapter-independence-driven-messaging
+    languages: [generic]
+    severity: ERROR
+    message: An adapter may not import another adapter.
+    paths:
+      include:
+        - "**/adapter/driven/messaging/**"
+    pattern-regex: >-
+      (?m)^\s*(?:import|from|use|require|include|export|_?\s*")[^\n]*[/.:]adapter[/.:]+(?!driven[/.:]+messaging(?=[/.:"'\s;)]))
+
+  # ------------------------------------------------- OPT-IN: relative imports
+  #
+  # Closes the parent-relative blind spot described at the top, but ONLY if your
+  # project routes every cross-boundary import through a path alias
+  # (`@application/port/driving/...`, `@domain/model/...`) so that `../` inside
+  # an adapter can only ever mean "another part of this adapter, or a sibling
+  # adapter I should not touch".
+  #
+  # Measured on a fixture WITHOUT aliases, this rule produced 14 findings, only
+  # one of which was a genuine sibling-adapter import — the other 13 were legal
+  # cross-layer imports written relatively. Enable it only after aliases exist,
+  # then re-run and confirm the count drops to the real violations.
+  #
+  # - id: adapter-relative-escape
+  #   languages: [generic]
+  #   severity: ERROR
+  #   message: >-
+  #     Adapter files must not use parent-relative imports. Use a path alias for
+  #     anything outside this adapter; `../` here can only reach another adapter.
+  #   paths:
+  #     include:
+  #       - "**/adapter/*/*/**"
+  #       - "**/adapters/*/*/**"
+  #   pattern-regex: >-
+  #     (?m)^\s*(?:import|from|export)[^\n]*["']\.\.\/
